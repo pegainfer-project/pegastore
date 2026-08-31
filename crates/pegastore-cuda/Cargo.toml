@@ -1,0 +1,22 @@
+[package]
+name = "pegastore-cuda"
+description = "Single-node pegastore backend: NUMA-pinned DRAM pools, CUDA copy engines, NVLink peer reads."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+pegastore = { path = "../pegastore" }
+cudarc = { version = "0.19.7", default-features = false, features = ["std", "driver", "dynamic-linking", "cuda-13000"] }
+libc = "0.2"
+bytes.workspace = true
+futures.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+futures.workspace = true
+
+[[example]]
+name = "weights_fanout"

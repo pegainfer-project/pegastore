@@ -1,0 +1,8 @@
+pegastore
+Copyright 2026 pegastore contributors
+
+Licensed under the Apache License, Version 2.0.
+
+Portions of pegastore-cuda (NUMA-pinned host allocation and CUDA copy
+helpers) are derived from pegaflow (https://github.com/pegaflow/pegaflow),
+Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES, Apache-2.0.

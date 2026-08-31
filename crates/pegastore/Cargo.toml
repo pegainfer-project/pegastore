@@ -1,0 +1,16 @@
+[package]
+name = "pegastore"
+description = "Placement-aware immutable large-object cache for AI workloads: multi-slot values across GPU / DRAM / SSD, shared across nodes."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bytes.workspace = true
+futures.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

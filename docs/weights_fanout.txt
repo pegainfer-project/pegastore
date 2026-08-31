@@ -1,0 +1,36 @@
+pegastore · weights fan-out
+shard: 4 slots × 1 GiB = 4 GiB
+topology: numa nodes: [0, 1]; gpu0→numa0; gpu1→numa0; gpu2→numa1; gpu3→numa1
+pinned pools: 2 × 12 GiB, ready in 2.81s
+
+put  Key("weights/v1/shard0")  Each([cpu:0, cpu:1])  from gpu0: 56.8 ms, 151.3 GB/s written (4 GiB × 2 replicas)
+  slot 0: 1 GiB @ [cpu:0, cpu:1]
+  slot 1: 1 GiB @ [cpu:0, cpu:1]
+  slot 2: 1 GiB @ [cpu:0, cpu:1]
+  slot 3: 1 GiB @ [cpu:0, cpu:1]
+
+A. get on every GPU — placement Each: each socket serves its own GPUs
+  gpu    numa         GB/s        ms  served from
+  0      0           184.8      23.2  cpu:0/Dram
+  1      0           184.6      23.3  cpu:0/Dram
+  2      1           174.4      24.6  cpu:1/Dram
+  3      1           173.4      24.8  cpu:1/Dram
+  aggregate: 693.4 GB/s (4 GPUs × 4.0 GiB in 24.8 ms)
+
+B. get on every GPU — placement Strict(cpu:1): far-socket GPUs cross the interconnect
+  gpu    numa         GB/s        ms  served from
+  0      0            63.2      67.9  cpu:1/Dram
+  1      0            63.2      68.0  cpu:1/Dram
+  2      1           115.7      37.1  cpu:1/Dram
+  3      1           115.4      37.2  cpu:1/Dram
+  aggregate: 252.8 GB/s (4 GPUs × 4.0 GiB in 68.0 ms)
+
+C. gpu0 published its copy — peers now read over NVLink, DRAM idle
+  gpu    numa         GB/s        ms  served from
+  1      0           310.0      13.9  gpu:0/External
+  2      1           285.8      15.0  gpu:0/External
+  3      1           264.8      16.2  gpu:0/External
+  aggregate: 794.3 GB/s (3 GPUs × 4.0 GiB in 16.2 ms)
+
+slot 0 replicas now: [cpu:0/Dram, cpu:1/Dram, gpu:0/External]
+done.
