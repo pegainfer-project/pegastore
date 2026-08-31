@@ -17,7 +17,7 @@ use clap::Parser;
 use log::warn;
 use pegastore_rdma::numa::read_cpu_topology_from_sysfs;
 use pegastore_rdma::rdma_topo::SystemTopology;
-use pegastore_rdma::{MemoryRegion, TransferDesc, TransferEngine, TransferOp, init_logging};
+use pegastore_rdma::{RegionDescriptor, TransferDesc, TransferEngine, TransferOp, init_logging};
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -292,6 +292,8 @@ struct EngineContext {
     client: TransferEngine,
     server_buf: NumaBuffer,
     client_buf: NumaBuffer,
+    /// What the client uses to address the server's buffer.
+    server_region: RegionDescriptor,
 }
 
 // ---------------------------------------------------------------------------
@@ -341,14 +343,14 @@ fn generate_task_schedule(
 // Build scatter lists for a task
 // ---------------------------------------------------------------------------
 
-fn build_random_block_scatter(
-    local_base: NonNull<u8>,
-    remote_base: NonNull<u8>,
+fn build_random_block_scatter<'a>(
+    local_base: u64,
+    remote: &'a RegionDescriptor,
     nblocks: usize,
     block_size: usize,
     pool_blocks: usize,
     rng: &mut SimpleRng,
-) -> Vec<TransferDesc> {
+) -> Vec<TransferDesc<'a>> {
     let mut seen = HashSet::with_capacity(nblocks.min(pool_blocks));
     let mut block_indices = Vec::with_capacity(nblocks);
     while block_indices.len() < nblocks {
@@ -363,9 +365,10 @@ fn build_random_block_scatter(
         .map(|block_idx| {
             let off = block_idx * block_size;
             TransferDesc {
-                local_ptr: unsafe { NonNull::new_unchecked(local_base.as_ptr().add(off)) },
-                remote_ptr: unsafe { NonNull::new_unchecked(remote_base.as_ptr().add(off)) },
+                local: local_base + off as u64,
+                remote: remote.addr + off as u64,
                 len: block_size,
+                region: remote,
             }
         })
         .collect()
@@ -402,8 +405,8 @@ fn run_bench(
 
     for (i, &nblocks) in schedule.iter().enumerate() {
         let descs = build_random_block_scatter(
-            ctx.client_buf.ptr,
-            ctx.server_buf.ptr,
+            ctx.client_buf.ptr.as_ptr() as u64,
+            &ctx.server_region,
             nblocks,
             block_size,
             pool_blocks,
@@ -523,20 +526,14 @@ fn create_engine_context(
     client_buf.fill(0xBB);
 
     let server = TransferEngine::new(nic_names, qps_per_peer).expect("server init failed");
-    server
-        .register_memory(&[MemoryRegion {
-            ptr: server_buf.ptr,
-            len: buf_size,
-        }])
-        .expect("server register_memory failed");
+    // SAFETY: `server_buf` outlives the engine context.
+    let server_region = unsafe { server.register_host(server_buf.ptr.as_ptr() as u64, buf_size) }
+        .expect("server register_host failed");
 
     let client = TransferEngine::new(nic_names, qps_per_peer).expect("client init failed");
-    client
-        .register_memory(&[MemoryRegion {
-            ptr: client_buf.ptr,
-            len: buf_size,
-        }])
-        .expect("client register_memory failed");
+    // SAFETY: `client_buf` outlives the engine context.
+    unsafe { client.register_host(client_buf.ptr.as_ptr() as u64, buf_size) }
+        .expect("client register_host failed");
 
     // Handshake: both sides prepare, then complete handshake to each other.
     let server_meta = match server
@@ -586,14 +583,15 @@ fn create_engine_context(
         client,
         server_buf,
         client_buf,
+        server_region,
     }
 }
 
 fn cleanup_engine_context(ctx: &EngineContext) {
-    if let Err(err) = ctx.client.unregister_memory(&[ctx.client_buf.ptr]) {
+    if let Err(err) = ctx.client.unregister(ctx.client_buf.ptr.as_ptr() as u64) {
         warn!("failed to unregister client benchmark memory: {err}");
     }
-    if let Err(err) = ctx.server.unregister_memory(&[ctx.server_buf.ptr]) {
+    if let Err(err) = ctx.server.unregister(ctx.server_buf.ptr.as_ptr() as u64) {
         warn!("failed to unregister server benchmark memory: {err}");
     }
 }
@@ -627,7 +625,7 @@ fn main() {
     let pool_blocks = pool_size / block_size;
 
     println!(
-        "pegaflow-cpu-bench: block_size={} blocks_per_task={} tasks={} warmup={} pool_size={} hugepages={}",
+        "pegastore-cpu-bench: block_size={} blocks_per_task={} tasks={} warmup={} pool_size={} hugepages={}",
         cli.block_size,
         cli.blocks_per_task,
         cli.tasks,

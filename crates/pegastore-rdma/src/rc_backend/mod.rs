@@ -10,19 +10,23 @@ use std::time::Instant;
 use log::{debug, info, warn};
 use parking_lot::Mutex;
 use sideway::ibverbs::AccessFlags;
+use sideway::ibverbs::memory_region::MemoryRegion;
+use sideway::ibverbs::protection_domain::ProtectionDomain;
 
 use self::runtime::RcRuntime;
 use self::session::{RcSession, RdmaOp};
-use self::state::{
-    AddrConnection, ConnNic, RcBackendState, RegisteredMemoryEntry, RemoteMemorySnapshot,
-};
-use std::ptr::NonNull;
+use self::state::{AddrConnection, ConnNic, RcBackendState, RegisteredMemoryEntry};
+use std::os::fd::RawFd;
 
 use mea::oneshot;
 
-use crate::engine::{NicHandshake, RegisteredMemoryRegion, TransferDesc, TransferOp};
+use crate::engine::{NicHandshake, RegionDescriptor, TransferDesc, TransferOp};
 use crate::error::{Result, TransferError};
 use crate::numa::NumaNode;
+
+fn mr_access() -> AccessFlags {
+    AccessFlags::LocalWrite | AccessFlags::RemoteWrite | AccessFlags::RemoteRead
+}
 
 struct NicGroup {
     nic_indices: Vec<usize>,
@@ -41,8 +45,6 @@ struct NumaRoundRobin {
     groups: HashMap<NumaNode, NicGroup>,
     /// Fallback for unknown NUMA or unmatched nodes (all NICs).
     fallback: NicGroup,
-    /// True when all NICs are on a single NUMA node (skip move_pages).
-    single_numa: bool,
 }
 
 impl NumaRoundRobin {
@@ -57,7 +59,6 @@ impl NumaRoundRobin {
             }
         }
 
-        let single_numa = map.len() <= 1;
 
         let groups: HashMap<NumaNode, NicGroup> = map
             .into_iter()
@@ -80,7 +81,6 @@ impl NumaRoundRobin {
         Self {
             groups,
             fallback,
-            single_numa,
         }
     }
 
@@ -144,75 +144,92 @@ impl RcBackend {
         self.runtimes.len()
     }
 
-    pub(crate) fn register_memory(&self, ptr: NonNull<u8>, len: usize) -> Result<()> {
+    pub(crate) fn num_nics(&self) -> usize {
+        self.runtimes.len()
+    }
+
+    /// # Safety
+    /// See [`crate::TransferEngine::register_host`].
+    pub(crate) unsafe fn register_host(&self, addr: u64, len: usize) -> Result<RegionDescriptor> {
+        // One move_pages at registration instead of one per op: pegastore's
+        // pools are NUMA-homogeneous by construction.
+        let numa = crate::numa::query_pages_numa(&[addr as *const u8])[0];
+        self.register_with(addr, len, numa, "host", |pd| {
+            // SAFETY: caller guarantees `[addr, addr + len)` is valid host memory.
+            unsafe { pd.reg_mr(addr as usize, len, mr_access()) }.map_err(|e| e.to_string())
+        })
+    }
+
+    /// # Safety
+    /// See [`crate::TransferEngine::register_dmabuf`].
+    pub(crate) unsafe fn register_dmabuf(
+        &self,
+        addr: u64,
+        len: usize,
+        fd: RawFd,
+        offset: u64,
+        numa: NumaNode,
+    ) -> Result<RegionDescriptor> {
+        self.register_with(addr, len, numa, "dmabuf", |pd| {
+            // SAFETY: caller guarantees `fd` exports `[offset, offset + len)`;
+            // `addr` becomes the IOVA so descriptors carry device VAs.
+            unsafe { pd.reg_dmabuf_mr(offset, len, addr, fd, mr_access()) }
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    fn register_with(
+        &self,
+        addr: u64,
+        len: usize,
+        numa: NumaNode,
+        kind: &str,
+        reg: impl Fn(&Arc<ProtectionDomain>) -> std::result::Result<Arc<MemoryRegion>, String>,
+    ) -> Result<RegionDescriptor> {
         if len == 0 {
             return Err(TransferError::InvalidArgument("len must be non-zero"));
         }
-        let raw = ptr.as_ptr() as u64;
-
-        // Register on every NIC's PD.
         let mut mrs = Vec::with_capacity(self.nic_count());
         for runtime in &self.runtimes {
-            let mr = unsafe {
-                runtime.pd.reg_mr(
-                    raw as usize,
-                    len,
-                    AccessFlags::LocalWrite | AccessFlags::RemoteWrite | AccessFlags::RemoteRead,
-                )
-            }
-            .map_err(|error| TransferError::Backend(error.to_string()))?;
-            mrs.push(mr);
+            mrs.push(reg(&runtime.pd).map_err(|e| {
+                TransferError::Backend(format!(
+                    "{kind} MR registration failed on nic={}: {e}",
+                    runtime.nic_name
+                ))
+            })?);
         }
-
+        let rkeys: Vec<u32> = mrs.iter().map(|mr| mr.rkey()).collect();
         let mut state = self.state.lock();
         Arc::make_mut(&mut state.registered).insert(RegisteredMemoryEntry {
-            base_ptr: raw,
+            base_ptr: addr,
             len,
+            numa,
             mrs,
         })?;
         debug!(
-            "memory registered: ptr={:#x}, len={}, nics={}",
-            raw,
-            len,
+            "memory registered: kind={kind}, addr={addr:#x}, len={len}, numa={numa}, nics={}",
             self.nic_count()
         );
-        Ok(())
+        Ok(RegionDescriptor {
+            addr,
+            len: len as u64,
+            rkeys,
+        })
     }
 
-    pub(crate) fn unregister_memory(&self, ptr: NonNull<u8>) -> Result<()> {
-        let raw = ptr.as_ptr() as u64;
+    pub(crate) fn unregister(&self, addr: u64) -> Result<()> {
         let mut state = self.state.lock();
-        let removed = Arc::make_mut(&mut state.registered).remove(raw);
+        let removed = Arc::make_mut(&mut state.registered).remove(addr);
         if removed.is_none() {
-            return Err(TransferError::MemoryNotRegistered { ptr: raw });
+            return Err(TransferError::MemoryNotRegistered { ptr: addr });
         }
-        debug!("memory unregistered: ptr={:#x}", raw);
+        debug!("memory unregistered: addr={addr:#x}");
         Ok(())
-    }
-
-    /// Snapshot registered memory for each NIC. Outer vec indexed by nic_idx.
-    fn snapshot_registered_memory(&self) -> Vec<Vec<RegisteredMemoryRegion>> {
-        let state = self.state.lock();
-        (0..self.nic_count())
-            .map(|nic_idx| {
-                // LocalMemoryMap iterates in base_ptr order already.
-                state
-                    .registered
-                    .iter()
-                    .map(|entry| RegisteredMemoryRegion {
-                        base_ptr: entry.base_ptr,
-                        len: entry.len as u64,
-                        rkey: entry.mrs[nic_idx].rkey(),
-                    })
-                    .collect()
-            })
-            .collect()
     }
 
     /// Create N RC QPs per NIC in INIT state, push to per-NIC pending queues,
     /// return per-NIC handshake data (each NIC carries N endpoints).
     fn prepare_handshake(&self) -> Result<Vec<NicHandshake>> {
-        let snapshots = self.snapshot_registered_memory();
         let mut nic_handshakes = Vec::with_capacity(self.nic_count());
 
         // Create all NIC × N QPs before locking state.
@@ -237,10 +254,7 @@ impl RcBackend {
             for s in sessions {
                 state.nics[nic_idx].pending.push_back(s);
             }
-            nic_handshakes.push(NicHandshake {
-                endpoints,
-                memory_regions: snapshots[nic_idx].clone(),
-            });
+            nic_handshakes.push(NicHandshake { endpoints });
         }
 
         Ok(nic_handshakes)
@@ -330,17 +344,13 @@ impl RcBackend {
         }
 
         // Validate snapshots and assemble the connection before locking.
-        let mut conn_nics = Vec::with_capacity(nic_count);
-        for (sessions, remote) in pending.into_iter().zip(remote_nics) {
-            let snapshot = Arc::new(RemoteMemorySnapshot::from_handshake(
-                &remote.memory_regions,
-            )?);
-            conn_nics.push(ConnNic {
+        let conn_nics: Vec<ConnNic> = pending
+            .into_iter()
+            .map(|sessions| ConnNic {
                 sessions: Arc::new(sessions),
-                remote_memory: snapshot,
                 rr_counter: AtomicUsize::new(0),
-            });
-        }
+            })
+            .collect();
 
         let mut state = self.state.lock();
         let removed = state.connecting.remove(remote_addr);
@@ -407,119 +417,85 @@ impl RcBackend {
         &self,
         op: TransferOp,
         remote_addr: &str,
-        descs: &[TransferDesc],
+        descs: &[TransferDesc<'_>],
     ) -> Result<Vec<oneshot::Receiver<Result<usize>>>> {
         if descs.is_empty() {
             return Ok(Vec::new());
         }
-
         let nic_count = self.nic_count();
-
-        // NUMA-aware NIC assignment: query the NUMA node of each descriptor's
-        // first page and route to a NIC on the same NUMA node.
-        let mut per_nic: Vec<Vec<TransferDesc>> = (0..nic_count).map(|_| Vec::new()).collect();
-        if self.numa_rr.single_numa {
-            // All NICs on one NUMA node — skip move_pages, plain round-robin.
-            for &desc in descs {
-                let nic_idx = self.numa_rr.fallback.next();
-                per_nic[nic_idx].push(desc);
-            }
-        } else {
-            let addrs: Vec<*const u8> = descs
-                .iter()
-                .map(|d| d.local_ptr.as_ptr() as *const u8)
-                .collect();
-            let numa_nodes = crate::numa::query_pages_numa(&addrs);
-            for (i, &desc) in descs.iter().enumerate() {
-                let nic_idx = self.numa_rr.pick(numa_nodes[i]);
-                per_nic[nic_idx].push(desc);
-            }
-        }
-
-        // --- Short lock: snapshot connection state (sessions, remote memory,
-        // local MR map are all Arc snapshots; lookups happen outside the lock) ---
         let lookup_start = Instant::now();
-        struct NicWork {
-            nic_idx: usize,
-            sessions: Arc<Vec<Arc<RcSession>>>,
-            remote_memory: Arc<RemoteMemorySnapshot>,
-            rot: usize,
-        }
-        let (registered, nic_snapshots) = {
-            let state = self.state.lock();
 
+        // Snapshot the registration map and the connection's sessions under
+        // the lock; resolution and posting run outside it.
+        let (registered, conn_nics) = {
+            let state = self.state.lock();
             let conn = state
                 .addr_connections
                 .get(remote_addr)
                 .ok_or(TransferError::Backend(format!(
                     "no connection for remote addr {remote_addr}"
                 )))?;
-
-            let mut snapshots = Vec::new();
-            for (nic_idx, nic_descs) in per_nic.iter().enumerate() {
-                if nic_descs.is_empty() {
-                    continue;
-                }
-                let nic = &conn.nics[nic_idx];
-                // Rotate the starting bucket each call so small batches still
-                // hit different QPs across calls.
-                let rot = nic.rr_counter.fetch_add(1, Ordering::Relaxed);
-                snapshots.push(NicWork {
-                    nic_idx,
-                    sessions: Arc::clone(&nic.sessions),
-                    remote_memory: Arc::clone(&nic.remote_memory),
-                    rot,
-                });
-            }
-            (Arc::clone(&state.registered), snapshots)
+            let nics: Vec<(Arc<Vec<Arc<RcSession>>>, usize)> = conn
+                .nics
+                .iter()
+                .map(|nic| {
+                    (
+                        Arc::clone(&nic.sessions),
+                        nic.rr_counter.fetch_add(1, Ordering::Relaxed),
+                    )
+                })
+                .collect();
+            (Arc::clone(&state.registered), nics)
         };
 
-        // --- Build ops outside the lock ---
-        let mut nic_work: Vec<(Arc<RcSession>, Vec<RdmaOp>)> = Vec::new();
-        for nic in nic_snapshots {
-            let nic_descs = &per_nic[nic.nic_idx];
-            // Per-WQE round-robin across the N sessions per NIC so a single
-            // batch can fill all N QPs (per-call RR would leave the rest idle).
-            let n = nic.sessions.len();
-            let per_bucket = nic_descs.len().div_ceil(n);
-            let mut buckets: Vec<Vec<RdmaOp>> =
-                (0..n).map(|_| Vec::with_capacity(per_bucket)).collect();
-
-            for (i, desc) in nic_descs.iter().enumerate() {
-                let local_ptr = desc.local_ptr.as_ptr() as u64;
-                let remote_ptr = desc.remote_ptr.as_ptr() as u64;
-                let len = desc.len;
-
-                if len == 0 {
-                    return Err(TransferError::InvalidArgument("len must be non-zero"));
-                }
-
-                let local_mr = registered
-                    .find_mr(nic.nic_idx, local_ptr, len)
-                    .ok_or(TransferError::MemoryNotRegistered { ptr: local_ptr })?;
-
-                let remote_rkey = nic.remote_memory.find_rkey(remote_ptr, len).ok_or(
-                    TransferError::InvalidArgument("remote memory not found in handshake snapshot"),
-                )?;
-
-                let bucket = nic.rot.wrapping_add(i) % n;
-                buckets[bucket].push(RdmaOp {
-                    local_mr,
-                    local_ptr,
-                    remote_ptr,
-                    len,
-                    remote_rkey,
-                });
+        // Resolve each op: local MR by registered range, NIC by that
+        // region's NUMA node, remote rkey from the peer's descriptor (NICs
+        // are index-paired across the two engines).
+        let mut per_nic: Vec<Vec<RdmaOp>> = (0..nic_count).map(|_| Vec::new()).collect();
+        for desc in descs {
+            if desc.len == 0 {
+                return Err(TransferError::InvalidArgument("len must be non-zero"));
             }
+            let entry = registered
+                .find_entry(desc.local, desc.len)
+                .ok_or(TransferError::MemoryNotRegistered { ptr: desc.local })?;
+            if !desc.region.contains(desc.remote, desc.len) {
+                return Err(TransferError::InvalidArgument(
+                    "remote range not covered by its region descriptor",
+                ));
+            }
+            let nic_idx = self.numa_rr.pick(entry.numa);
+            let remote_rkey = *desc.region.rkeys.get(nic_idx).ok_or(
+                TransferError::InvalidArgument("region descriptor has no rkey for paired NIC"),
+            )?;
+            per_nic[nic_idx].push(RdmaOp {
+                local_mr: Arc::clone(&entry.mrs[nic_idx]),
+                local_ptr: desc.local,
+                remote_ptr: desc.remote,
+                len: desc.len,
+                remote_rkey,
+            });
+        }
 
+        // Spread each NIC's ops over its N sessions, rotating the start.
+        let mut nic_work: Vec<(Arc<RcSession>, Vec<RdmaOp>)> = Vec::new();
+        for (nic_idx, ops) in per_nic.into_iter().enumerate() {
+            if ops.is_empty() {
+                continue;
+            }
+            let (sessions, rot) = &conn_nics[nic_idx];
+            let n = sessions.len();
+            let mut buckets: Vec<Vec<RdmaOp>> =
+                (0..n).map(|_| Vec::with_capacity(ops.len().div_ceil(n))).collect();
+            for (i, rdma_op) in ops.into_iter().enumerate() {
+                buckets[rot.wrapping_add(i) % n].push(rdma_op);
+            }
             for (q_idx, prepared) in buckets.into_iter().enumerate() {
-                if prepared.is_empty() {
-                    continue;
+                if !prepared.is_empty() {
+                    nic_work.push((Arc::clone(&sessions[q_idx]), prepared));
                 }
-                nic_work.push((Arc::clone(&nic.sessions[q_idx]), prepared));
             }
         }
-        let lookup_dur = lookup_start.elapsed();
 
         debug!(
             "batch_transfer_async_{:?}: nics_active={}/{}, chunks={}, lookup_ms={:.3}",
@@ -527,10 +503,9 @@ impl RcBackend {
             nic_work.len(),
             nic_count,
             descs.len(),
-            lookup_dur.as_secs_f64() * 1000.0,
+            lookup_start.elapsed().as_secs_f64() * 1000.0,
         );
 
-        // --- Submit outside lock ---
         let mut receivers = Vec::with_capacity(nic_work.len());
         for (session, prepared) in nic_work {
             receivers.push(session.transfer_batch_async(prepared, op)?);

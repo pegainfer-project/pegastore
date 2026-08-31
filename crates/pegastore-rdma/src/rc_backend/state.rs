@@ -5,19 +5,22 @@ use std::sync::atomic::AtomicUsize;
 use sideway::ibverbs::memory_region::MemoryRegion;
 
 use super::session::RcSession;
-use crate::engine::{NicHandshake, RegisteredMemoryRegion};
+use crate::engine::NicHandshake;
+use crate::numa::NumaNode;
 use crate::error::{Result, TransferError};
 
 #[derive(Clone)]
 pub(super) struct RegisteredMemoryEntry {
     pub(super) base_ptr: u64,
     pub(super) len: usize,
+    /// NUMA node of the memory; drives NIC selection (UNKNOWN → any NIC).
+    pub(super) numa: NumaNode,
     /// One MR per NIC (different PDs → different rkeys).
     pub(super) mrs: Vec<Arc<MemoryRegion>>,
 }
 
 /// Local registered memory, ordered by base pointer. Insertion rejects
-/// overlapping regions so `find_mr` can resolve any address with a single
+/// overlapping regions so `find_entry` can resolve any address with a single
 /// predecessor lookup. Shared as an RCU-style snapshot: register/unregister
 /// clone-and-swap under the state lock, the transfer hot path reads its own
 /// `Arc` outside the lock.
@@ -68,87 +71,13 @@ impl LocalMemoryMap {
         self.entries.remove(&base_ptr)
     }
 
-    /// Entries in base_ptr order.
-    pub(super) fn iter(&self) -> impl Iterator<Item = &RegisteredMemoryEntry> {
-        self.entries.values()
-    }
 
-    /// Find the MR (for `nic_idx`) of the region fully covering `[ptr, ptr+len)`.
-    pub(super) fn find_mr(
-        &self,
-        nic_idx: usize,
-        ptr: u64,
-        len: usize,
-    ) -> Option<Arc<MemoryRegion>> {
-        self.find_entry(ptr, len)
-            .map(|entry| Arc::clone(&entry.mrs[nic_idx]))
-    }
 
     /// Non-overlap makes the predecessor the only possible covering region.
-    fn find_entry(&self, ptr: u64, len: usize) -> Option<&RegisteredMemoryEntry> {
+    pub(super) fn find_entry(&self, ptr: u64, len: usize) -> Option<&RegisteredMemoryEntry> {
         let end = ptr.checked_add(len as u64)?;
         let (_, entry) = self.entries.range(..=ptr).next_back()?;
         (end <= entry.base_ptr + entry.len as u64).then_some(entry)
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct RemoteMemoryEntry {
-    base_ptr: u64,
-    end_ptr: u64,
-    rkey: u32,
-}
-
-/// Sorted, non-overlapping remote regions from one handshake. Immutable after
-/// validation; shared via `Arc` so rkey lookup runs outside the state lock.
-#[derive(Debug)]
-pub(super) struct RemoteMemorySnapshot {
-    entries: Vec<RemoteMemoryEntry>,
-}
-
-impl RemoteMemorySnapshot {
-    /// Validate and index the remote memory regions received during handshake.
-    pub(super) fn from_handshake(remote_memory_regions: &[RegisteredMemoryRegion]) -> Result<Self> {
-        let mut entries = Vec::with_capacity(remote_memory_regions.len());
-        for entry in remote_memory_regions.iter().copied() {
-            if entry.len == 0 {
-                return Err(TransferError::Backend(
-                    "handshake response contains zero-length memory region".to_string(),
-                ));
-            }
-            let Some(end_ptr) = entry.base_ptr.checked_add(entry.len) else {
-                return Err(TransferError::Backend(
-                    "handshake response contains memory region overflow".to_string(),
-                ));
-            };
-            entries.push(RemoteMemoryEntry {
-                base_ptr: entry.base_ptr,
-                end_ptr,
-                rkey: entry.rkey,
-            });
-        }
-        entries.sort_unstable_by_key(|e| e.base_ptr);
-        for pair in entries.windows(2) {
-            if pair[1].base_ptr < pair[0].end_ptr {
-                return Err(TransferError::Backend(
-                    "handshake response contains overlapping memory regions".to_string(),
-                ));
-            }
-        }
-        Ok(Self { entries })
-    }
-
-    /// Look up the rkey of the region fully covering `[ptr, ptr+len)`.
-    pub(super) fn find_rkey(&self, ptr: u64, len: usize) -> Option<u32> {
-        let end = ptr.checked_add(len as u64)?;
-        let index = match self.entries.binary_search_by_key(&ptr, |e| e.base_ptr) {
-            Ok(i) => i,
-            Err(0) => return None,
-            Err(i) => i - 1,
-        };
-        // binary_search already guarantees entry.base_ptr <= ptr.
-        let entry = &self.entries[index];
-        (end <= entry.end_ptr).then_some(entry.rkey)
     }
 }
 
@@ -171,11 +100,9 @@ impl PerNicState {
     }
 }
 
-/// One NIC's slice of an established connection: the N connected sessions
-/// and the remote memory snapshot from the handshake.
+/// One NIC's slice of an established connection: the N connected sessions.
 pub(super) struct ConnNic {
     pub(super) sessions: Arc<Vec<Arc<RcSession>>>,
-    pub(super) remote_memory: Arc<RemoteMemorySnapshot>,
     /// Round-robin counter for picking among the N sessions.
     pub(super) rr_counter: AtomicUsize,
 }
@@ -224,60 +151,11 @@ impl RcBackendState {
 mod tests {
     use super::*;
 
-    #[test]
-    fn remote_snapshot_rejects_overlapping_regions() {
-        let regions = vec![
-            RegisteredMemoryRegion {
-                base_ptr: 0x1000,
-                len: 0x200,
-                rkey: 1,
-            },
-            RegisteredMemoryRegion {
-                base_ptr: 0x1100,
-                len: 0x100,
-                rkey: 2,
-            },
-        ];
-
-        let error =
-            RemoteMemorySnapshot::from_handshake(&regions).expect_err("overlap should fail");
-        assert_eq!(
-            error,
-            TransferError::Backend(
-                "handshake response contains overlapping memory regions".to_string()
-            )
-        );
-    }
-
-    #[test]
-    fn remote_snapshot_finds_rkey_in_sorted_entries() {
-        let regions = vec![
-            RegisteredMemoryRegion {
-                base_ptr: 0x3000,
-                len: 0x100,
-                rkey: 3,
-            },
-            RegisteredMemoryRegion {
-                base_ptr: 0x1000,
-                len: 0x100,
-                rkey: 1,
-            },
-            RegisteredMemoryRegion {
-                base_ptr: 0x2000,
-                len: 0x100,
-                rkey: 2,
-            },
-        ];
-        let snapshot = RemoteMemorySnapshot::from_handshake(&regions).expect("snapshot");
-
-        assert_eq!(snapshot.find_rkey(0x2080, 0x10), Some(2));
-        assert!(snapshot.find_rkey(0x2500, 0x10).is_none());
-    }
-
     fn entry(base_ptr: u64, len: usize) -> RegisteredMemoryEntry {
         RegisteredMemoryEntry {
             base_ptr,
             len,
+            numa: NumaNode::UNKNOWN,
             mrs: Vec::new(),
         }
     }

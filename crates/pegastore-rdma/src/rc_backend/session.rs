@@ -212,7 +212,7 @@ impl RcSession {
         qpn: u32,
     ) -> Result<()> {
         thread::Builder::new()
-            .name("pegaflow-rc-session".to_string())
+            .name("pegastore-rc-session".to_string())
             .spawn(move || {
                 if numa_node.is_valid()
                     && let Err(e) = crate::numa::pin_thread_to_numa_node(numa_node)

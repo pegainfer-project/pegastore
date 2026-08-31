@@ -282,8 +282,11 @@ fn enumerate_rdma_nics() -> Vec<RdmaNicInfo> {
             Err(_) => continue,
         };
 
-        // Skip bond devices
-        if name.contains("bond") {
+        // Only NICs with a port that is actually up can carry traffic. On
+        // RoCE hosts the live device is often the bond (mlx5_bond_0) while
+        // its slaves and unused IB ports report DOWN.
+        if !nic_has_active_port(&entry.path()) {
+            log::debug!("skipping RDMA NIC {name}: no active port");
             continue;
         }
 
@@ -345,6 +348,18 @@ pub fn get_pcie_path(pci_addr: &str) -> Vec<String> {
         })
         .map(|s| s.to_string())
         .collect()
+}
+
+/// True if any `ports/<n>/state` under the device reads `4: ACTIVE`.
+fn nic_has_active_port(dev: &Path) -> bool {
+    let Ok(ports) = fs::read_dir(dev.join("ports")) else {
+        return false;
+    };
+    ports.flatten().any(|port| {
+        fs::read_to_string(port.path().join("state"))
+            .map(|s| s.trim_start().starts_with("4:"))
+            .unwrap_or(false)
+    })
 }
 
 /// Resolve the NUMA node for an RDMA NIC by name (e.g. "mlx5_0").
