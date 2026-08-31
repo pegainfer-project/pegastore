@@ -363,7 +363,7 @@ fn nic_has_active_port(dev: &Path) -> bool {
 }
 
 /// Resolve the NUMA node for an RDMA NIC by name (e.g. "mlx5_0").
-pub(crate) fn nic_numa_node(nic_name: &str) -> NumaNode {
+pub fn nic_numa_node(nic_name: &str) -> NumaNode {
     let device_link = format!("/sys/class/infiniband/{}/device", nic_name);
     let pci_addr = match fs::read_link(&device_link) {
         Ok(target) => target

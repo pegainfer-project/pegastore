@@ -204,3 +204,45 @@ pub fn init() -> Result<()> {
     // SAFETY: cuInit(0) is always sound.
     check(unsafe { sys::cuInit(0) }, "cuInit")
 }
+
+/// Whether the driver can export this GPU's allocations as dma-buf fds
+/// (`CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED`).
+pub fn dmabuf_supported(gpu: &Gpu) -> bool {
+    let mut dev: sys::CUdevice = 0;
+    let mut v: std::ffi::c_int = 0;
+    // SAFETY: plain driver queries with valid out-pointers.
+    unsafe {
+        sys::cuDeviceGet(&mut dev, gpu.index as i32) == sys::cudaError_enum::CUDA_SUCCESS
+            && sys::cuDeviceGetAttribute(
+                &mut v,
+                sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED,
+                dev,
+            ) == sys::cudaError_enum::CUDA_SUCCESS
+            && v != 0
+    }
+}
+
+/// Export `[ptr, ptr + len)` of device memory as a dma-buf fd, for
+/// `ibv_reg_dmabuf_mr`. Both bounds must be host-page aligned. The caller
+/// owns the fd; an RDMA MR keeps its own reference, so it may be closed
+/// once registered.
+///
+/// # Safety
+/// `ptr` must be a live device allocation in a context bound to this thread.
+pub unsafe fn dmabuf_fd(ptr: u64, len: usize) -> Result<std::os::fd::RawFd> {
+    let mut fd: std::os::fd::RawFd = -1;
+    // SAFETY: out-pointer is a valid c_int; range validity is the caller's.
+    unsafe {
+        check(
+            sys::cuMemGetHandleForAddressRange(
+                (&mut fd as *mut std::os::fd::RawFd).cast(),
+                ptr,
+                len,
+                sys::CUmemRangeHandleType::CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD,
+                0,
+            ),
+            "cuMemGetHandleForAddressRange(DMA_BUF_FD)",
+        )?;
+    }
+    Ok(fd)
+}

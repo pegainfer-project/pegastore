@@ -62,6 +62,22 @@ Full output: [`docs/weights_fanout.txt`](docs/weights_fanout.txt).
 cargo run --release -p pegastore-cuda --example weights_fanout -- --gib 1 --slots 4
 ```
 
+Across the wire, HBM is an address too. 1 GiB on GPU 2, registered as a
+dma-buf, pulled and pushed by RDMA on the same host's 2×100GbE bond —
+no bounce buffer, every byte compared afterwards:
+
+| | path | | verified |
+|---|---|---:|---|
+| A | GPU 2 → GPU 3, RDMA READ | 22.9 GiB/s | 1024 MiB |
+| B | GPU 2 → DRAM, RDMA READ | 23.0 GiB/s | 1024 MiB |
+| C | DRAM → GPU 3, RDMA WRITE | 23.0 GiB/s | 1024 MiB |
+
+That is the bond's line rate. Full output: [`docs/gpu_rdma_bench.txt`](docs/gpu_rdma_bench.txt).
+
+```sh
+cargo run --release -p pegastore-rdma --example gpu_rdma_bench -- --src-gpu 2 --dst-gpu 3
+```
+
 ---
 
 ## What this is for
@@ -98,7 +114,7 @@ Two layers, in the OpenDAL tradition:
 
 Backends: `Memory` (the semantic oracle; every other backend must match it),
 `Local` (per-NUMA pinned DRAM + CUDA copy engines + NVLink peers),
-`Remote` (metaserver + RDMA — next).
+`Remote` (metaserver + the RDMA engine in `pegastore-rdma` — next).
 
 Errors are for programs: a closed `ErrorKind`, `Temporary` vs `Permanent`,
 context for humans. `Unavailable` is never a miss.

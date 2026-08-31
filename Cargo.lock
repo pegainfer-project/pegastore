@@ -550,6 +550,7 @@ dependencies = [
  "log",
  "mea",
  "parking_lot",
+ "pegastore-cuda",
  "rdma-mummy-sys",
  "serde",
  "sideway",

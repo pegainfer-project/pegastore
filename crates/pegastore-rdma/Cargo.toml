@@ -20,6 +20,10 @@ libc = "0.2"
 
 [dev-dependencies]
 clap = { version = "4.5", features = ["derive"] }
+pegastore-cuda = { path = "../pegastore-cuda" }
 
 [[example]]
 name = "cpu_bench"
+
+[[example]]
+name = "gpu_rdma_bench"

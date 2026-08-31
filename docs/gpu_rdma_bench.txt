@@ -1,0 +1,40 @@
+# tray03 (4x GB300, RoCE 2x100GbE LACP mlx5_bond_0 on NUMA1), 2026-08-31
+# $ gpu_rdma_bench --mib 1024 --iters 5   (src GPU2 / dst GPU3, both NUMA1 = NIC-local)
+gpu_rdma_bench: 1024 MiB, 4 MiB blocks, 5 iters
+  NICs: mlx5_bond_0 (NUMA1)
+  src: GPU2 (NUMA1)   dst/sink: GPU3 (NUMA1)
+  registered 3 GPU regions (dma-buf) + 1 host region on 1 NIC(s) in 3.0 ms; src rkeys=[389550]
+
+=== A  RDMA READ  GPU2 -> GPU3
+  best 22.88 GiB/s   mean 22.86 GiB/s   (256 ops)
+  verify: OK (1024 MiB compared)
+
+=== B  RDMA READ  GPU2 -> host (NUMA1)
+  best 22.99 GiB/s   mean 22.98 GiB/s
+  verify: OK (1024 MiB compared)
+
+=== C  RDMA WRITE host (NUMA1) -> GPU3
+  best 23.00 GiB/s   mean 22.97 GiB/s
+  verify: OK (1024 MiB compared)
+
+all cases verified.
+
+# $ gpu_rdma_bench --src-gpu 0 --dst-gpu 1   (both NUMA0 = cross-socket from the NIC)
+gpu_rdma_bench: 1024 MiB, 4 MiB blocks, 5 iters
+  NICs: mlx5_bond_0 (NUMA1)
+  src: GPU0 (NUMA0)   dst/sink: GPU1 (NUMA0)
+  registered 3 GPU regions (dma-buf) + 1 host region on 1 NIC(s) in 2.5 ms; src rkeys=[389550]
+
+=== A  RDMA READ  GPU0 -> GPU1
+  best 22.71 GiB/s   mean 22.70 GiB/s   (256 ops)
+  verify: OK (1024 MiB compared)
+
+=== B  RDMA READ  GPU0 -> host (NUMA0)
+  best 22.82 GiB/s   mean 22.81 GiB/s
+  verify: OK (1024 MiB compared)
+
+=== C  RDMA WRITE host (NUMA0) -> GPU1
+  best 22.83 GiB/s   mean 22.82 GiB/s
+  verify: OK (1024 MiB compared)
+
+all cases verified.
