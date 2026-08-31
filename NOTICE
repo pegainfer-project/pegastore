@@ -6,3 +6,8 @@ Licensed under the Apache License, Version 2.0.
 Portions of pegastore-cuda (NUMA-pinned host allocation and CUDA copy
 helpers) are derived from pegaflow (https://github.com/pegaflow/pegaflow),
 Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES, Apache-2.0.
+
+pegastore-rdma is relocated from pegaflow-transfer (v1 RC engine, commit
+b5d4acff) of pegaflow (https://github.com/pegaflow/pegaflow),
+Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES, Apache-2.0.
+The per-file SPDX headers are preserved.
